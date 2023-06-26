@@ -7,9 +7,11 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/go-acme/lego/v4/certcrypto"
@@ -67,9 +69,7 @@ func expandACMEUser(d *schema.ResourceData) (*acmeUser, error) {
 // saveACMERegistration takes an *registration.Resource and sets the appropriate fields
 // for a registration resource.
 func saveACMERegistration(d *schema.ResourceData, reg *registration.Resource) error {
-	d.Set("registration_url", reg.URI)
-
-	return nil
+	return d.Set("registration_url", reg.URI)
 }
 
 // expandACMEClient creates a connection to an ACME server from resource data,
@@ -119,7 +119,7 @@ type certificateResourceExpander interface {
 }
 
 // expandCertificateResource takes saved state in the certificate resource
-// and returns an certificate.Resource.
+// and returns a certificate.Resource.
 func expandCertificateResource(d certificateResourceExpander) *certificate.Resource {
 	cert := &certificate.Resource{
 		Domain:  d.Get("certificate_domain").(string),
@@ -147,19 +147,23 @@ func expandCertificateResource(d certificateResourceExpander) *certificate.Resou
 	return cert
 }
 
-// saveCertificateResource takes an certificate.Resource and sets fields.
+// saveCertificateResource takes a certificate.Resource and sets fields.
 func saveCertificateResource(d *schema.ResourceData, cert *certificate.Resource, password string) error {
-	d.Set("certificate_url", cert.CertURL)
-	d.Set("certificate_domain", cert.Domain)
-	d.Set("private_key_pem", string(cert.PrivateKey))
 	issued, issuedNotAfter, issuer, err := splitPEMBundle(cert.Certificate)
 	if err != nil {
 		return err
 	}
-
-	d.Set("certificate_pem", string(issued))
-	d.Set("issuer_pem", string(issuer))
-	d.Set("certificate_not_after", issuedNotAfter)
+	err = errors.Join(
+		d.Set("certificate_url", cert.CertURL),
+		d.Set("certificate_domain", cert.Domain),
+		d.Set("private_key_pem", string(cert.PrivateKey)),
+		d.Set("certificate_pem", string(issued)),
+		d.Set("issuer_pem", string(issuer)),
+		d.Set("certificate_not_after", issuedNotAfter),
+	)
+	if err != nil {
+		return err
+	}
 
 	// Set PKCS12 data. This is only set if there is a private key
 	// present.
@@ -169,15 +173,91 @@ func saveCertificateResource(d *schema.ResourceData, cert *certificate.Resource,
 			return err
 		}
 
-		d.Set("certificate_p12", string(pfxB64))
+		err = d.Set("certificate_p12", string(pfxB64))
 	} else {
-		d.Set("certificate_p12", "")
+		err = d.Set("certificate_p12", "")
+	}
+
+	return err
+}
+
+func persistCertificateData(name string, cert *certificate.Resource, password string) error {
+	_, err := os.Stat(name)
+	if err == nil {
+		// old file exists, remove it
+		err = os.Remove(name)
+		if err != nil {
+			return fmt.Errorf("error removing file with certificates: %s", err.Error())
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("error checking if file exists: %s", err.Error())
+	}
+
+	// (re)create the file
+	f, err := os.Create(name)
+	if err != nil {
+		return fmt.Errorf("error creating file with certificates: %s", err.Error())
+	}
+	defer f.Close()
+
+	issued, issuedNotAfter, issuer, err := splitPEMBundle(cert.Certificate)
+	if err != nil {
+		return err
+	}
+	m := make(map[string]string)
+	m["certificate_url"] = cert.CertURL
+	m["certificate_domain"] = cert.Domain
+	m["private_key_pem"] = string(cert.PrivateKey)
+	m["certificate_pem"] = string(issued)
+	m["issuer_pem"] = string(issuer)
+	m["certificate_not_after"] = issuedNotAfter
+
+	// Set PKCS12 data. This is only set if there is a private key
+	// present.
+	if len(cert.PrivateKey) > 0 {
+		pfxB64, err := bundleToPKCS12(cert.Certificate, cert.PrivateKey, password)
+		if err != nil {
+			return err
+		}
+		m["certificate_p12"] = string(pfxB64)
+	} else {
+		m["certificate_p12"] = ""
+	}
+
+	err = json.NewEncoder(f).Encode(m)
+	if err != nil {
+		return fmt.Errorf("error writing certificates to file: %s", err.Error())
 	}
 
 	return nil
 }
 
-// certSecondsRemaining takes an certificate.Resource, parses the
+func readPersistedCertificateData(d *schema.ResourceData) error {
+	// read from the file
+	f, err := os.Open(resourceFileName(d))
+	if err != nil {
+		return fmt.Errorf("error reading file with certificates: %s", err.Error())
+	}
+	defer f.Close()
+
+	var m map[string]string
+	err = json.NewDecoder(f).Decode(&m)
+	if err != nil {
+		return fmt.Errorf("error decoding certificates from file: %s", err.Error())
+	}
+
+	return errors.Join(
+		d.Set("certificate_url", m["certificate_url"]),
+		d.Set("certificate_domain", m["certificate_domain"]),
+		d.Set("private_key_pem", m["private_key_pem"]),
+		d.Set("certificate_pem", m["certificate_pem"]),
+		d.Set("issuer_pem", m["issuer_pem"]),
+		d.Set("certificate_not_after", m["certificate_not_after"]),
+		d.Set("certificate_p12", m["certificate_p12"]),
+	)
+}
+
+// certSecondsRemaining takes a certificate.Resource, parses the
 // certificate, and computes the seconds that it has remaining.
 func certSecondsRemaining(cert *certificate.Resource) (int64, error) {
 	x509Certs, err := parsePEMBundle(cert.Certificate)
@@ -193,10 +273,10 @@ func certSecondsRemaining(cert *certificate.Resource) (int64, error) {
 	expiry := c.NotAfter.Unix()
 	now := time.Now().Unix()
 
-	return (expiry - now), nil
+	return expiry - now, nil
 }
 
-// certDaysRemaining takes an certificate.Resource, parses the
+// certDaysRemaining takes a certificate.Resource, parses the
 // certificate, and computes the days that it has remaining.
 func certDaysRemaining(cert *certificate.Resource) (int64, error) {
 	remaining, err := certSecondsRemaining(cert)
@@ -343,7 +423,7 @@ func csrFromPEM(pemData []byte) (*x509.CertificateRequest, error) {
 }
 
 // validateKeyType validates a key_type resource parameter is correct.
-func validateKeyType(v interface{}, k string) (ws []string, errors []error) {
+func validateKeyType(v interface{}, _ string) (ws []string, errors []error) {
 	value := v.(string)
 	found := false
 	for _, w := range []string{"P256", "P384", "2048", "4096", "8192"} {
@@ -361,7 +441,7 @@ func validateKeyType(v interface{}, k string) (ws []string, errors []error) {
 // validateDNSChallengeConfig ensures that the values supplied to the
 // dns_challenge resource parameter in the acme_certificate resource
 // are string values only.
-func validateDNSChallengeConfig(v interface{}, k string) (ws []string, errors []error) {
+func validateDNSChallengeConfig(v interface{}, _ string) (ws []string, errors []error) {
 	value := v.(map[string]interface{})
 	bad := false
 	for _, w := range value {

@@ -3,13 +3,20 @@ package acme
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log"
+	"math/rand"
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
+	"github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 )
@@ -17,20 +24,13 @@ import (
 // resourceACMECertificate returns the current version of the
 // acme_registration resource and needs to be updated when the schema
 // version is incremented.
-func resourceACMECertificate() *schema.Resource { return resourceACMECertificateV5() }
-
-func resourceACMECertificateV5() *schema.Resource {
+func resourceACMECertificate() *schema.Resource {
 	return &schema.Resource{
-		Create:        resourceACMECertificateCreate,
-		Read:          resourceACMECertificateRead,
+		CreateContext: resourceACMECertificateCreate,
+		ReadContext:   resourceACMECertificateRead,
 		CustomizeDiff: resourceACMECertificateCustomizeDiff,
-		Update:        resourceACMECertificateUpdate,
-		Delete:        resourceACMECertificateDelete,
-		MigrateState:  resourceACMECertificateMigrateState,
-		SchemaVersion: 5,
-		StateUpgraders: []schema.StateUpgrader{
-			resourceACMECertificateStateUpgraderV4(),
-		},
+		UpdateContext: resourceACMECertificateUpdate,
+		DeleteContext: resourceACMECertificateDelete,
 		Schema: map[string]*schema.Schema{
 			"account_key_pem": {
 				Type:      schema.TypeString,
@@ -229,11 +229,18 @@ func resourceACMECertificateV5() *schema.Resource {
 				Optional: true,
 				Default:  true,
 			},
+			"vault_directory": {
+				Type:     schema.TypeString,
+				Optional: true,
+				DefaultFunc: func() (interface{}, error) {
+					return os.Getwd()
+				},
+			},
 		},
 	}
 }
 
-func resourceACMECertificateCreate(d *schema.ResourceData, meta interface{}) error {
+func resourceACMECertificateCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	// Pre-generate resource UUID here, in case there is a serious
 	// issue with UUID generation that would lead to inconsistency.
 	//
@@ -243,18 +250,38 @@ func resourceACMECertificateCreate(d *schema.ResourceData, meta interface{}) err
 	// current certificate instead.
 	resourceUUID, err := uuid.GenerateUUID()
 	if err != nil {
-		return fmt.Errorf("error generating UUID for resource: %s", err)
+		return diag.Errorf("error generating UUID for resource: %s", err)
 	}
+
+	unlock, err := tryLockOrWait(d)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	// if unlock is nil, lock was acquired and the resource values should be read from the file system
+	if unlock == nil {
+		d.SetId(resourceUUID)
+
+		err = readPersistedCertificateData(d)
+		if err != nil {
+			return diag.Errorf("error reading and setting certificate from file system: %s", err)
+		}
+
+		return resourceACMECertificateRead(ctx, d, meta)
+	}
+
+	// if unlock is not nil, lock was acquire and unlock should be executed after creating the certificates
+	defer unlock()
 
 	client, _, err := expandACMEClient(d, meta, true)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	dnsCloser, err := setCertificateChallengeProviders(client, d)
 	defer dnsCloser()
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	var cert *certificate.Resource
@@ -263,7 +290,7 @@ func resourceACMECertificateCreate(d *schema.ResourceData, meta interface{}) err
 		var csr *x509.CertificateRequest
 		csr, err = csrFromPEM([]byte(v.(string)))
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 		cert, err = client.Certificate.ObtainForCSR(certificate.ObtainForCSRRequest{
 			CSR:            csr,
@@ -290,19 +317,32 @@ func resourceACMECertificateCreate(d *schema.ResourceData, meta interface{}) err
 	}
 
 	if err != nil {
-		return fmt.Errorf("error creating certificate: %s", err)
+		return diag.Errorf("error creating certificate: %s", err)
 	}
 
 	d.SetId(resourceUUID)
 	password := d.Get("certificate_p12_password").(string)
 	if err := saveCertificateResource(d, cert, password); err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	return resourceACMECertificateRead(d, meta)
+	oldName, newName := d.GetChange(d.Get("common_name").(string))
+	if oldName != nil && oldName.(string) != "" && oldName.(string) != newName.(string) {
+		// if the resource is being recreated, we need to remove the old certificate
+		err = os.Remove(filepath.Join(d.Get("vault_directory").(string), oldName.(string), "resource.json"))
+		if err != nil {
+			log.Printf("[WARN] error removing old certificate %s, please remove it manually: %s", oldName.(string), err)
+		}
+	}
+
+	if err := persistCertificateData(resourceFileName(d), cert, password); err != nil {
+		return diag.FromErr(err)
+	}
+
+	return resourceACMECertificateRead(ctx, d, meta)
 }
 
-func resourceACMECertificateRead(d *schema.ResourceData, meta interface{}) error {
+func resourceACMECertificateRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	// This is a workaround to correct issues with some versions of the
 	// resource prior to 1.3.2 where a renewal failure would possibly
 	// delete the certificate.
@@ -310,7 +350,7 @@ func resourceACMECertificateRead(d *schema.ResourceData, meta interface{}) error
 		// Try to recover the certificate from the ACME API.
 		client, _, err := expandACMEClient(d, meta, true)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 
 		srcCR, err := client.Certificate.Get(d.Get("certificate_url").(string), true)
@@ -321,14 +361,14 @@ func resourceACMECertificateRead(d *schema.ResourceData, meta interface{}) error
 			// 1.3.2, this will probably be rare. If we start relying on
 			// this behavior on a more general level, we may need to
 			// investigate this more. Just error on everything for now.
-			return err
+			return diag.FromErr(err)
 		}
 
 		dstCR := expandCertificateResource(d)
 		dstCR.Certificate = srcCR.Certificate
 		password := d.Get("certificate_p12_password").(string)
 		if err := saveCertificateResource(d, dstCR, password); err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
@@ -337,7 +377,7 @@ func resourceACMECertificateRead(d *schema.ResourceData, meta interface{}) error
 
 // resourceACMECertificateCustomizeDiff checks the certificate for renewal and
 // flags it as NewComputed if it needs a renewal.
-func resourceACMECertificateCustomizeDiff(_ context.Context, d *schema.ResourceDiff, meta interface{}) error {
+func resourceACMECertificateCustomizeDiff(_ context.Context, d *schema.ResourceDiff, _ interface{}) error {
 	// Ensure duplicate providers for dns_challenge are not provided.
 	providerMap := make(map[string]bool)
 	for _, v := range d.Get("dns_challenge").([]interface{}) {
@@ -354,7 +394,7 @@ func resourceACMECertificateCustomizeDiff(_ context.Context, d *schema.ResourceD
 		}
 	}
 
-	// There's nothing for us to do in a Create diff, so if there's no ID yet,
+	// there's nothing for us to do in a 'Create' diff, so if there's no ID yet,
 	// just pass this part.
 	if d.Id() == "" {
 		return nil
@@ -365,24 +405,55 @@ func resourceACMECertificateCustomizeDiff(_ context.Context, d *schema.ResourceD
 		return err
 	}
 
-	if expired {
-		d.SetNewComputed("certificate_pem")
-		d.SetNewComputed("certificate_p12")
-		d.SetNewComputed("certificate_url")
-		d.SetNewComputed("certificate_domain")
-		d.SetNewComputed("private_key_pem")
-		d.SetNewComputed("issuer_pem")
+	if !expired {
+		return nil
 	}
 
-	return nil
+	resFile := resourceFileName(d)
+	_, err = os.Stat(resFile)
+	if err == nil {
+		err = os.Remove(resFile)
+		if err != nil {
+			log.Printf("[ERROR] failed to remove certificate file %s, please remove it manually: %s", resFile, err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		log.Printf("[ERROR] failed to check certificate file %s, please remove it manually if it exists: %s", resFile, err)
+	}
+
+	return errors.Join(
+		d.SetNewComputed("certificate_pem"),
+		d.SetNewComputed("certificate_p12"),
+		d.SetNewComputed("certificate_url"),
+		d.SetNewComputed("certificate_domain"),
+		d.SetNewComputed("private_key_pem"),
+		d.SetNewComputed("issuer_pem"),
+	)
 }
 
 // resourceACMECertificateUpdate renews a certificate if it has been flagged as changed.
-func resourceACMECertificateUpdate(d *schema.ResourceData, meta interface{}) error {
+func resourceACMECertificateUpdate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+	unlock, err := tryLockOrWait(d)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	// if unlock is nil, lock was acquired and the resource values should be read from the file system
+	if unlock == nil {
+		err = readPersistedCertificateData(d)
+		if err != nil {
+			return diag.Errorf("error reading and setting certificate from file system: %s", err)
+		}
+
+		return nil
+	}
+
+	// if unlock is not nil, lock was acquire and unlock should be executed after creating the certificates
+	defer unlock()
+
 	// We don't need to do anything else here if the certificate hasn't been diffed
 	expired, err := resourceACMECertificateHasExpired(d)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	if !expired {
@@ -391,7 +462,10 @@ func resourceACMECertificateUpdate(d *schema.ResourceData, meta interface{}) err
 			cert := expandCertificateResource(d)
 			password := d.Get("certificate_p12_password").(string)
 			if err := saveCertificateResource(d, cert, password); err != nil {
-				return err
+				return diag.FromErr(err)
+			}
+			if err := persistCertificateData(resourceFileName(d), cert, password); err != nil {
+				return diag.FromErr(err)
 			}
 		}
 		return nil
@@ -402,7 +476,7 @@ func resourceACMECertificateUpdate(d *schema.ResourceData, meta interface{}) err
 
 	client, _, err := expandACMEClient(d, meta, true)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	cert := expandCertificateResource(d)
@@ -410,17 +484,25 @@ func resourceACMECertificateUpdate(d *schema.ResourceData, meta interface{}) err
 	dnsCloser, err := setCertificateChallengeProviders(client, d)
 	defer dnsCloser()
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	newCert, err := client.Certificate.Renew(*cert, true, d.Get("must_staple").(bool), d.Get("preferred_chain").(string))
+	newCert, err := client.Certificate.RenewWithOptions(*cert, &certificate.RenewOptions{
+		Bundle:         true,
+		PreferredChain: d.Get("preferred_chain").(string),
+		MustStaple:     d.Get("must_staple").(bool),
+	})
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	password := d.Get("certificate_p12_password").(string)
 	if err := saveCertificateResource(d, newCert, password); err != nil {
-		return err
+		return diag.FromErr(err)
+	}
+
+	if err := persistCertificateData(resourceFileName(d), cert, password); err != nil {
+		return diag.FromErr(err)
 	}
 
 	// Complete, safe to turn off partial mode now.
@@ -429,26 +511,57 @@ func resourceACMECertificateUpdate(d *schema.ResourceData, meta interface{}) err
 }
 
 // resourceACMECertificateDelete "deletes" the certificate by revoking it.
-func resourceACMECertificateDelete(d *schema.ResourceData, meta interface{}) error {
+func resourceACMECertificateDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+	unlock, err := tryLockOrWait(d)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	// if unlock is nil, lock was acquired and the certificate should be revoked (if configured)
+	if unlock == nil {
+		return nil
+	}
+
+	defer func() {
+		// instead of removing a lock file, the dir with lock and cert files is removed
+		err = os.RemoveAll(resourceDir(d))
+		if err != nil {
+			log.Printf("[ERROR] failed to remove dir with certificate and lock files %s, please remove it manually: %s",
+				resourceDir(d), err)
+		}
+	}()
+
 	if !d.Get("revoke_certificate_on_destroy").(bool) {
 		return nil
 	}
 
 	client, _, err := expandACMEClient(d, meta, true)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	cert := expandCertificateResource(d)
 	remaining, err := certSecondsRemaining(cert)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	if remaining >= 0 {
-		if err := client.Certificate.Revoke(cert.Certificate); err != nil {
-			return err
+	if remaining < 0 {
+		return nil
+	}
+
+	err = client.Certificate.Revoke(cert.Certificate)
+	if err != nil {
+		var e *acme.ProblemDetails
+		if !errors.As(err, &e) {
+			return diag.FromErr(err)
 		}
+
+		if e.HTTPStatus == 400 && e.Type == "urn:ietf:params:acme:error:alreadyRevoked" {
+			return nil
+		}
+
+		return diag.FromErr(err)
 	}
 
 	return nil
@@ -457,8 +570,8 @@ func resourceACMECertificateDelete(d *schema.ResourceData, meta interface{}) err
 // resourceACMECertificateHasExpired checks the acme_certificate
 // resource to see if it has expired.
 func resourceACMECertificateHasExpired(d certificateResourceExpander) (bool, error) {
-	mindays := d.Get("min_days_remaining").(int)
-	if mindays < 0 {
+	minDays := d.Get("min_days_remaining").(int)
+	if minDays < 0 {
 		log.Printf("[WARN] min_days_remaining is set to less than 0, certificate will never be renewed")
 		return false, nil
 	}
@@ -469,7 +582,7 @@ func resourceACMECertificateHasExpired(d certificateResourceExpander) (bool, err
 		return false, err
 	}
 
-	if int64(mindays) >= remaining {
+	if int64(minDays) >= remaining {
 		return true, nil
 	}
 
@@ -514,7 +627,7 @@ func resourceACMECertificatePreCheckDelay(delay int) dns01.WrapPreCheckFunc {
 					}
 				}
 
-				log.Printf("[DEBUG] [%s] acme: Waiting an additional %d second(s) for DNS record propagation.", domain, remaining)
+				log.Printf("[DEBUG] [%s] acme: waiting an additional %d second(s) for DNS record propagation.", domain, remaining)
 				time.Sleep(time.Second * time.Duration(interval))
 				elapsed += interval
 			}
@@ -522,5 +635,72 @@ func resourceACMECertificatePreCheckDelay(delay int) dns01.WrapPreCheckFunc {
 
 		// A previous pre-check failed, return and exit.
 		return stop, err
+	}
+}
+
+type resGetter interface {
+	Get(key string) interface{}
+}
+
+func resourceDir(d resGetter) string {
+	return filepath.Join(d.Get("vault_directory").(string), d.Get("common_name").(string))
+}
+
+func lockFileName(d resGetter) string {
+	return filepath.Join(resourceDir(d), "lock")
+}
+
+func resourceFileName(d resGetter) string {
+	return filepath.Join(resourceDir(d), "resource.json")
+}
+
+func tryLockOrWait(d *schema.ResourceData) (cleanup func(), err error) {
+	minWait := 10
+	maxWait := 2000
+
+	wait := rand.New(rand.NewSource(time.Now().UnixNano())).Intn(maxWait-minWait+1) + minWait
+	time.Sleep(time.Duration(wait) * time.Millisecond)
+
+	lockFileName := lockFileName(d)
+
+	_, err = os.Open(lockFileName)
+	if os.IsNotExist(err) {
+		log.Printf("[INFO] creating lock file '%s'", lockFileName)
+
+		err = os.MkdirAll(resourceDir(d), 0777)
+		if err != nil {
+			return nil, fmt.Errorf("error creating temp directory: %s", err)
+		}
+		_, err = os.Create(lockFileName)
+		if err != nil {
+			return nil, fmt.Errorf("error creating temp lock file: %s", err)
+		}
+
+		return func() {
+			err := os.Remove(lockFileName)
+			if err != nil {
+				log.Printf("[WARN] error removing temp lock file '%s', please remove it manually!: %s", lockFileName, err)
+			}
+		}, nil
+	} else {
+		log.Printf("[INFO] lock file '%s' already exists, waiting for it to be removed", lockFileName)
+		op := func() error {
+			_, err := os.Open(lockFileName)
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				return backoff.Permanent(err)
+			}
+
+			return fmt.Errorf("can not create certificates, lock file still exists")
+		}
+
+		err := backoff.Retry(op, backoff.NewExponentialBackOff())
+		if err != nil {
+			return nil, err
+		}
+
+		return nil, nil
 	}
 }

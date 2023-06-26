@@ -1,23 +1,24 @@
 package acme
 
 import (
+	"context"
+	"errors"
+
 	"github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/registration"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
 // resourceACMERegistration returns the current version of the
 // acme_registration resource and needs to be updated when the schema
 // version is incremented.
-func resourceACMERegistration() *schema.Resource { return resourceACMERegistrationV1() }
 
-func resourceACMERegistrationV1() *schema.Resource {
+func resourceACMERegistration() *schema.Resource {
 	return &schema.Resource{
-		Create:        resourceACMERegistrationCreate,
-		Read:          resourceACMERegistrationRead,
-		Delete:        resourceACMERegistrationDelete,
-		MigrateState:  resourceACMERegistrationMigrateState,
-		SchemaVersion: 1,
+		CreateContext: resourceACMERegistrationCreate,
+		ReadContext:   resourceACMERegistrationRead,
+		DeleteContext: resourceACMERegistrationDelete,
 		Schema: map[string]*schema.Schema{
 			"account_key_pem": {
 				Type:      schema.TypeString,
@@ -60,11 +61,11 @@ func resourceACMERegistrationV1() *schema.Resource {
 	}
 }
 
-func resourceACMERegistrationCreate(d *schema.ResourceData, meta interface{}) error {
+func resourceACMERegistrationCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	// register and agree to the TOS
 	client, _, err := expandACMEClient(d, meta, false)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	var reg *registration.Resource
@@ -83,15 +84,15 @@ func resourceACMERegistrationCreate(d *schema.ResourceData, meta interface{}) er
 	}
 
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
 	d.SetId(reg.URI)
 
-	return resourceACMERegistrationRead(d, meta)
+	return resourceACMERegistrationRead(ctx, d, meta)
 }
 
-func resourceACMERegistrationRead(d *schema.ResourceData, meta interface{}) error {
+func resourceACMERegistrationRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	_, user, err := expandACMEClient(d, meta, true)
 	if err != nil {
 		if regGone(err) {
@@ -99,25 +100,25 @@ func resourceACMERegistrationRead(d *schema.ResourceData, meta interface{}) erro
 			return nil
 		}
 
-		return err
+		return diag.FromErr(err)
 	}
 
 	// save the reg
-	return saveACMERegistration(d, user.Registration)
+	return diag.FromErr(saveACMERegistration(d, user.Registration))
 }
 
-func resourceACMERegistrationDelete(d *schema.ResourceData, meta interface{}) error {
+func resourceACMERegistrationDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	client, _, err := expandACMEClient(d, meta, true)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	return client.Registration.DeleteRegistration()
+	return diag.FromErr(client.Registration.DeleteRegistration())
 }
 
 func regGone(err error) bool {
-	e, ok := err.(*acme.ProblemDetails)
-	if !ok {
+	var e *acme.ProblemDetails
+	if !errors.As(err, &e) {
 		return false
 	}
 

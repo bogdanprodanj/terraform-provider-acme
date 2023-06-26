@@ -17,10 +17,10 @@ import (
 	"github.com/vancluever/terraform-provider-acme/v2/acme/dnsplugin"
 )
 
-// setCertificateChallengeProviders sets all of the challenge providers in the
+// setCertificateChallengeProviders sets all the challenge providers in the
 // client that are needed for obtaining the certificate.
 //
-// The returned func() is a closer for all of the configured DNS providers that
+// The returned func() is a closer for all the configured DNS providers that
 // should be called when they are no longer needed (i.e. in a defer after one of
 // the CRUD functions are complete).
 func setCertificateChallengeProviders(client *lego.Client, d *schema.ResourceData) (func(), error) {
@@ -161,7 +161,7 @@ type DNSProviderWrapper struct {
 	providers []challenge.ProviderTimeout
 }
 
-// NewDNSProviderWrapper returns an freshly initialized
+// NewDNSProviderWrapper returns a freshly initialized
 // DNSProviderWrapper.
 func NewDNSProviderWrapper() (*DNSProviderWrapper, error) {
 	return &DNSProviderWrapper{}, nil

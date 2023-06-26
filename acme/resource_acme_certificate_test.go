@@ -20,11 +20,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
-	"github.com/rainycape/memcache"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -42,10 +42,15 @@ func TestAccACMECertificate_basic(t *testing.T) {
 				Config: testAccACMECertificateConfig(),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestMatchResourceAttr("acme_certificate.certificate", "id", uuidRegexp),
+					resource.TestMatchResourceAttr("acme_certificate.certificate_1", "id", uuidRegexp),
 					resource.TestMatchResourceAttr("acme_certificate.certificate", "certificate_url", certURLRegexp),
+					resource.TestMatchResourceAttr("acme_certificate.certificate_1", "certificate_url", certURLRegexp),
 					testAccCheckACMECertificateValid("acme_certificate.certificate", "www", "www2"),
+					testAccCheckACMECertificateValid("acme_certificate.certificate_1", "www", "www2"),
 					testAccCheckACMECertificateIntermediateEqual("acme_certificate.certificate", getPebbleCertificate(mainIntermediateURL)),
+					testAccCheckACMECertificateIntermediateEqual("acme_certificate.certificate_1", getPebbleCertificate(mainIntermediateURL)),
 					testAccCheckACMECertificateStatus("acme_certificate.certificate", certificateStatusValid),
+					testAccCheckACMECertificateStatus("acme_certificate.certificate_1", certificateStatusValid),
 					testAccCheckEnvironNotChanged(wantEnv),
 				),
 			},
@@ -625,19 +630,14 @@ func testAccCheckACMECertificateWebrootTestServer() (func(), string, error) {
 func testAccCheckACMECertificateMemcacheTestServer() (func(), error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/acme-challenge/", func(w http.ResponseWriter, r *http.Request) {
-		client, err := memcache.New(memcacheHost)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("memcached connect: %s", err), http.StatusBadRequest)
-			return
-		}
-
+		client := memcache.New(memcacheHost)
 		item, err := client.Get(r.URL.Path)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("memcached get: %s", err), http.StatusBadRequest)
 			return
 		}
 
-		w.Write(item.Value)
+		_, _ = w.Write(item.Value)
 	})
 
 	server := &http.Server{
@@ -681,7 +681,7 @@ func testAccCheckACMECertificateStatus(name, expected string) resource.TestCheck
 	return func(s *terraform.State) error {
 		rs, ok := s.RootModule().Resources[name]
 		if !ok {
-			return fmt.Errorf("Can't find ACME certificate: %s", name)
+			return fmt.Errorf("can't find ACME certificate: %s", name)
 		}
 
 		certPem := rs.Primary.Attributes["certificate_pem"]
@@ -763,9 +763,27 @@ resource "acme_certificate" "certificate" {
     }
   }
 }
+
+resource "acme_certificate" "certificate_1" {
+  account_key_pem           = "${acme_registration.reg.account_key_pem}"
+  common_name               = "www.${var.domain}"
+  subject_alternative_names = ["www2.${var.domain}"]
+
+  recursive_nameservers        = ["%s"]
+  disable_complete_propagation = true
+
+  dns_challenge {
+    provider = "exec"
+    config = {
+      EXEC_PATH = "%s"
+    }
+  }
+}
 `, pebbleDirBasic,
 		pebbleCertDomain,
 		pebbleCertDomain,
+		pebbleChallTestDNSSrv,
+		pebbleChallTestDNSScriptPath,
 		pebbleChallTestDNSSrv,
 		pebbleChallTestDNSScriptPath,
 	)
